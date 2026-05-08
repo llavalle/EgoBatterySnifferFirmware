@@ -6,25 +6,56 @@ over USB serial, and can also act as a minimal tool by transmitting commands.
 
 ## Hardware wiring
 
+The exact wiring depends on whether you want to **transmit commands** as
+well as listen, or just **passively sniff** an existing tool↔battery
+conversation. Pick one — they're not the same circuit.
+
+### Active wiring (TX + RX)
+
+To both listen and inject commands, the bus needs a HIGH-side path to 5 V so
+the line idles HIGH between bits. Two options, both work:
+
 ```
-Mega 5V --[470 ohm]--+-- D pin
-                     +-- Pin 2   (digital — edge detection / TX)
-                     +-- A0      (analog — direction detection)
-Mega GND ----------- - pin
+                  +-- D pin
+                  |
+5V --[ R or D ]--+-+-- Pin 2  (digital — edge detection / TX)
+                  |
+                  +-- A0     (analog — direction detection)
+GND -------------- - pin
 ```
 
-Pin 2 is `INPUT`; the line idles HIGH at ~4.0 V via the 470 Ω pull-up to 5 V,
-matching the level real EGO tools drive. The Arduino pulls LOW via
-`OUTPUT/LOW` only during TX. **Never drive `OUTPUT HIGH`** — the resistor
-handles HIGH.
+| `R or D`                         | Idle HIGH | Notes                                                                                                                                                                                                       |
+|----------------------------------|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **470 Ω resistor**               | ~5 V open, drops with load | Simple, what was used in the original Arduino sketch. The actual idle HIGH depends on whatever else is loading the bus.                                                                              |
+| **1N4148 diode + 100 Ω series**  | ~4.3 V    | **Recommended.** The diode's 0.7 V forward drop pins the idle HIGH right at the ~4 V level a real EGO tool drives, so the bus looks "natural" to the battery. The diode also blocks reverse current back into the Mega's 5 V rail. The 100 Ω caps the current when Pin 2 pulls LOW. |
+
+Wire the diode anode-to-5V, cathode toward the bus (current flows 5V → bus
+only). Pin 2 stays `INPUT` at idle and flips to `OUTPUT/LOW` only during TX.
+**Never drive `OUTPUT HIGH`** — the diode (or resistor) is what creates the
+HIGH level.
 
 A0 taps the same node and is sampled at the start of each frame to determine
 who's driving the line (see [Direction detection](#direction-detection)).
 
-### Passive sniffing
-For passive sniffing of a real tool↔battery conversation, **remove the 470 Ω
-pull-up** (or replace with ≥10 kΩ) so we don't load the bus, and disable any
-TX path (auto-ADJUST is off by default).
+### Passive-sniffing wiring (RX only)
+
+For sniffing alone — capturing real tool↔battery exchanges without ever
+transmitting — **remove the diode/resistor and don't feed 5 V at all**. The
+real tool already drives the bus HIGH; adding our own pull-up shifts the
+idle level and risks being noticed by the BMS.
+
+```
+                +-- D pin   (driven by the real tool/battery)
+                +-- Pin 2   (INPUT, high impedance)
+                +-- A0      (INPUT, direction detection)
+GND ----------- - pin
+```
+
+A 10 kΩ in series between Pin 2 and the bus is optional but a sensible
+belt-and-suspenders: if Pin 2 ever gets configured as `OUTPUT` by mistake,
+the resistor prevents it from fighting the tool's drive. Auto-ADJUST is OFF
+by default at boot, so the firmware won't TX unless you trigger it via the
+serial keys.
 
 ## Wire format
 
@@ -161,9 +192,9 @@ drive the current setpoint and just reports back what it's delivering.
 battery →  ID                              \
 battery →  ID                                >  heartbeat + invite, ~580 ms
 battery →  START_  data=0x0000              /
-tool    →  START_  data=0x00D7                (charger identifier — non-zero!)
+tool    →  START_  data=<charger id>          (non-zero, varies per charger model)
 battery →  START_  data=0x0000                (re-issued)
-tool    →  START_  data=0x00D7                (re-issued)
+tool    →  START_  data=<charger id>          (re-issued)
 battery →  EVACHG  data=0x0403                (enter charge mode)
 tool    →  EVACHG  data=0x0403                (ack)
 battery →  GETCG1  data=0x0000   ; tool  →  OUTCG1  data=0x0000
@@ -183,16 +214,59 @@ Notable charging-mode behavior:
 - **Closed-loop CC charging.** Battery repeatedly sends `ADDCUR data=5`
   (asking for +5 units of current); charger echoes `OUTCUR` with the actual
   delivered current, which ramps monotonically. When the battery drops to
-  `ADDCUR=2`, OUTCUR's rate of climb slows — the BMS is fine-tuning. The
-  charger doesn't decide how much to push; the battery does.
+  `ADDCUR=2`, OUTCUR's rate of climb slows — the BMS is fine-tuning. As
+  the battery approaches full, the BMS switches from `ADDCUR` to `DECCUR`
+  and `OUTCUR` ramps **down** for the taper / balance phase. The charger
+  doesn't decide how much to push; the battery does.
+- **`CHGFUL` fires before the taper actually finishes.** Observed roughly
+  the moment the BMS is happy with the battery's state of charge for use,
+  followed by ~70 s more `OUTCUR` taper driven by `DECCUR`. The
+  charger's "all green" LED indicator and CHGFUL appear to coincide; the
+  fan keeps running until the actual current settles.
+- **`CHGPCT` can exceed 100%.** Raw SOC values up to 117 % observed during
+  absorption. The BMS appears to use a percentage that overshoots before
+  settling. Display layers should cap to 100 % for sanity.
 - **Charger never reads cells / temps.** No `RD_VOL`, `RD_TMP`, `RD_SPC`,
   `RD_CAP`, or `RD_FSH` in the entire charge session — the charger trusts
   the BMS via `ADDCUR` and `CHGPCT`.
 - **`CHGPCT` reports SOC.** Battery sends actual percentage in real time
   (28 → 29 → 30 % observed). Charger always replies `0x0001` (ack/seen).
-- **`START_` from the charger has data `0x00D7`** — the only place we've
-  seen a non-zero `START_` payload. Possibly a charger identifier or
-  capability code.
+- **`START_` from the charger varies per charger model.** Observed: `0x00D7`
+  (215) on a 3 A charger, `0x000A` (10) on an 8 A charger. Two-sample
+  evidence — probably a model / capability code, but not a session counter.
+
+### Charger + Gen2 battery — already full
+
+If the battery is already at full charge when plugged in, the charger
+recognises this after the standard handshake and skips straight into a
+graceful end-of-session sequence. **No `EN_OUT`, no `ADDCUR`/`OUTCUR`,
+no telemetry loop** — the charger never enables its output and both
+sides go to sleep within ~3 seconds of plug-in:
+
+```
+battery →  ID, ID                              (heartbeat)
+battery →  START_  data=0x0000
+tool    →  START_  data=<charger id>
+battery →  EVACHG  data=0x0000   ; tool  →  EVACHG  data=0x0000
+battery →  GETCG1  data=0x0000   ; tool  →  OUTCG1  data=0x1000
+battery →  GET_VM  data=0x0000   ; tool  →  OUT_VM  data=0x1770   (60.00 V advertised)
+battery →  GET_CM  data=0x0000   ; tool  →  OUT_CM  data=0x0320   (8.00 A advertised — capability)
+battery →  FANOFF  data=0x0000   ; tool  →  FANOFF  data=0x0000   (skip the fan-ramp branch)
+battery →  DISOUT  data=0x0000   ; tool  →  DISOUT  data=0x0005   (disable output; tool ack with 5)
+battery →  CHGFUL  data=0x0000   ; tool  →  CHGFUL  data=0x0000   (full handshake)
+battery →  SLEEP_  data=0x0000   ; tool  →  SLEEP_  data=0x0000   (terminate session)
+[bus idle]
+```
+
+Notes:
+- **The fork happens after `OUT_CM`.** With a not-full battery the charger
+  sends `FAN_ON` and ramps; with a full battery it sends `FANOFF` and
+  jumps to the shutdown branch.
+- `EVACHG`/`OUTCG1` payloads also differ from the active-charge case
+  (`0x0000` vs `0x0403`, `0x1000` vs `0x0000`). The full-battery payloads
+  may be flags/state codes; not enough samples yet to be sure.
+- `OUT_CM` here is the charger's **rated** output current, not a setpoint
+  for an ongoing charge — the output is never enabled this session.
 
 ### "Dumb" tool (any battery)
 
@@ -241,17 +315,22 @@ what it's actually doing.
 
 | Command   | Wire bytes (rev) | Direction        | Notes                                                    |
 |-----------|------------------|------------------|----------------------------------------------------------|
-| `START_`  | `_TRATS`         | **batt → tool** *and* **tool → batt** | Battery sends `0x0000` (same as diagnostic). Charger replies with its own `START_`, data `0x00D7` (215) — first observed non-zero `START_` payload, likely a charger identifier. |
-| `EVACHG`  | `GHCAVE`         | both             | "Enter charge mode" (electric-vehicle-adjust-charge?). Both sides exchange `data=0x0403` (1027). Looks like an explicit mode marker. |
-| `GETCG1` / `OUTCG1` | `1GCTEG` / `1GCTUO` | batt / tool | "Charge stage 1" query/reply. Both `data=0x0000` in observed sample. |
-| `GET_VM` / `OUT_VM` | `MV_TEG` / `MV_TUO` | batt / tool | Battery asks the charger's output voltage. `OUT_VM` data is centivolts (e.g. `0x1770 = 6000` → 60.00 V). |
-| `GET_CM` / `OUT_CM` | `MC_TEG` / `MC_TUO` | batt / tool | Battery asks the charger's output current. `OUT_CM` data is centiamps (e.g. `0x012C = 300` → 3.00 A). |
-| `EN_OUT`  | `TUO_NE`         | tool → batt      | Charger toggles its output: `data=0x0001` enables, `0x0000` disables. |
+| `START_`  | `_TRATS`         | **batt → tool** *and* **tool → batt** | Battery sends `0x0000` (same as diagnostic). Charger replies with its own `START_` payload that **varies per charger model** — observed `0x00D7` (215) on a 3 A charger, `0x000A` (10) on an 8 A charger. Likely a model / capability code. |
+| `EVACHG`  | `GHCAVE`         | both             | "Enter charge mode" (electric-vehicle-adjust-charge?). `data=0x0403` (1027) on an active charge; `data=0x0000` on a full-battery session. Looks like a mode/state marker. |
+| `GETCG1` / `OUTCG1` | `1GCTEG` / `1GCTUO` | batt / tool | "Charge stage 1" query/reply. Active-charge session: both `0x0000`. Full-battery session: charger replies `0x1000` (4096). Possibly a state flag. |
+| `GET_VM` / `OUT_VM` | `MV_TEG` / `MV_TUO` | batt / tool | Battery asks the charger's output voltage. `OUT_VM` data is centivolts (e.g. `0x1770 = 6000` → 60.00 V). On a full-battery session this is the charger's rated voltage, not a live setpoint. |
+| `GET_CM` / `OUT_CM` | `MC_TEG` / `MC_TUO` | batt / tool | Battery asks the charger's output current. `OUT_CM` data is centiamps (e.g. `0x012C = 300` → 3.00 A; `0x0320 = 800` → 8.00 A). On a full-battery session this is the charger's **rated** capability, not an ongoing setpoint. |
+| `EN_OUT`  | `TUO_NE`         | tool → batt      | Charger toggles its output: `data=0x0001` enables, `0x0000` disables. **Skipped on a full-battery session** — see `DISOUT`. |
+| `DISOUT`  | `TUOSID`         | both             | Disable output. Sent in the full-battery end-of-session sequence in place of `EN_OUT`. Battery sends `0x0000`, charger acks with `0x0005` (5; meaning unclear — possibly seconds). |
 | `CHGING`  | `GNIGHC`         | both             | "Charging" heartbeat / handshake. Data `0x0000` both sides. |
-| `ADDCUR`  | `RUCDDA`         | batt → tool      | Battery requests an increment to charge current (delta in unknown unit; observed values 2 and 5). Drives the closed-loop ramp. |
-| `OUTCUR`  | `RUCTUO`         | tool → batt      | Charger reports actual current it's delivering. Increases monotonically while battery sends `ADDCUR>0`; rate of increase tracks `ADDCUR` magnitude. |
-| `FAN_ON`  | `NO_NAF`         | both             | Fan control. Battery sends a request (always `0x0064 = 100`), charger replies with the actual setting (ramps 5 → 14 → 20 → 28 → … → 139). Units uncertain — looks like a PWM duty / set-point. |
+| `CHGFUL`  | `LUFGHC`         | both             | "Charge full." BMS signals the battery is **functionally ready to use** — *not* "charging is done". Observed firing **mid-session** during a real charge cycle: ~70 s of `OUTCUR` taper continued after `CHGFUL` (194 → 164 cA), driven by `DECCUR>=0` from the BMS. Also used in the already-full plug-in sequence (where `CHGFUL` fires within ~3 s with no charging in between). Both sides exchange `data=0x0000`. |
+| `ADDCUR`  | `RUCDDA`         | batt → tool      | Battery requests an increment to charge current (delta in unknown unit; observed values 2 and 5). Drives the closed-loop ramp **up**. Dominant during early charging; stops being sent once the BMS is into the taper phase. Not seen at all on an already-full session. |
+| `DECCUR`  | `RUCCED`         | batt → tool      | Battery requests a *decrement* to charge current — counterpart to `ADDCUR`, dominant during the taper / top-off phase. Observed values 0..3 (data=0 most common). Charger doesn't echo `DECCUR`; it just lowers its `OUTCUR` in response. |
+| `OUTCUR`  | `RUCTUO`         | tool → batt      | Charger reports actual current it's delivering. Climbs monotonically while battery sends `ADDCUR>0`; tapers monotonically while battery sends `DECCUR>=0`. |
+| `FAN_ON`  | `NO_NAF`         | both             | Fan control during active charging. Battery sends a request (always `0x0064 = 100`), charger replies with the actual setting (ramps 5 → 14 → 20 → 28 → … → 139). Units uncertain — looks like a PWM duty / set-point. |
+| `FANOFF`  | `FFONAF`         | both             | Fan off. Sent in the full-battery end-of-session sequence in place of `FAN_ON` (no thermal load to dissipate). Both sides exchange `data=0x0000`. |
 | `CHGPCT`  | `TCPGHC`         | both             | State-of-charge percentage. Battery reports actual SOC (e.g. 28 → 29 → 30 % during the capture). Charger always replies `0x0001` — likely an "ack" rather than its own value. |
+| `SLEEP_`  | `_PEELS`         | both             | Session terminator. Sent at the end of a full-battery session; bus goes idle afterwards. Both sides exchange `data=0x0000`. |
 
 ### Direction is read from the ADC, not inferred
 
@@ -310,7 +389,18 @@ After init, a steady ~200 ms-per-exchange telemetry loop:
 
 ## Helpers
 
-- `Helpers/decode.py` — offline frame decoder for serial logs
-- `Helpers/crc_check.py` — verifies Dallas CRC8 against captures
-- `Helpers/verify_live.py` — live capture verification
-- `Helpers/analyze_nexus.py` — pattern analysis across captures
+- `helpers/decode.py` — offline frame decoder for serial logs
+- `helpers/crc_check.py` — verifies Dallas CRC8 against captures
+- `helpers/verify_live.py` — live capture verification
+- `helpers/analyze_nexus.py` — pattern analysis across captures
+
+> Note: these helpers parse the **legacy human-readable** serial output
+> from the original Arduino sketch. The current PlatformIO firmware emits
+> NDJSON, so these scripts will need updating before they're useful
+> against live captures from the new firmware.
+
+## License
+
+GNU General Public License v3.0 or later (`GPL-3.0-or-later`). See
+[LICENSE](LICENSE) for the full text. Source files carry the SPDX
+identifier so license scanners pick it up automatically.
