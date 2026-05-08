@@ -22,6 +22,10 @@
 //   CRC = Dallas 1-Wire CRC8 (poly 0x31, refin/refout, init 0)
 // Frames with 8N+1 bits carry a leading framing bit that must be dropped
 // before byte extraction (e.g. 73-bit single message -> 72 bits = 9 bytes).
+//
+// Output is NDJSON: one self-describing JSON object per line, terminated by
+// '\n'. Top-level types: hello | frame | tx | evt. Field schema is owned by
+// guiplan.md (Phase 0).
 
 #define DATA_PIN 2
 #define DIR_PIN  A0             // analog tap for direction detection (same node as DATA_PIN)
@@ -56,7 +60,6 @@ const uint32_t FRAME_GAP_US    = 1500;  // HIGH > this  -> end of frame
 uint8_t  frameBits[FRAME_BUF_BYTES];
 uint16_t bitCount = 0;
 uint32_t lastEdgeTime = 0;
-uint32_t frameStartTime = 0;
 
 uint32_t framesSeen = 0;
 
@@ -169,6 +172,64 @@ struct {
 } sweep = { false, 0, 0 };
 uint16_t SWEEP_GAP_MS = 100;
 
+// ---- NDJSON output helpers ----
+// Field schema is owned by guiplan.md (Phase 0).
+//
+// Each emitter starts the object inline: Serial.print(F("{\"t\":\"<type>\""))
+// and then chains fields via the helpers below. The first field is the type
+// itself (no leading comma), so every helper emits a leading ',' and the
+// caller closes with Serial.println('}').
+
+void jsonField(const __FlashStringHelper *key) {
+  Serial.print(F(",\""));
+  Serial.print(key);
+  Serial.print(F("\":"));
+}
+
+void jsonIntField(const __FlashStringHelper *key, int32_t val) {
+  jsonField(key);
+  Serial.print(val);
+}
+
+void jsonFstrField(const __FlashStringHelper *key, const __FlashStringHelper *val) {
+  jsonField(key);
+  Serial.print('"');
+  Serial.print(val);
+  Serial.print('"');
+}
+
+void jsonBytesField(const __FlashStringHelper *key, const uint8_t *bytes, uint16_t n) {
+  jsonField(key);
+  Serial.print('"');
+  for (uint16_t i = 0; i < n; i++) {
+    if (i > 0) Serial.print(' ');
+    printHex2(bytes[i]);
+  }
+  Serial.print('"');
+}
+
+// Decode the 6-byte byte-reversed command name to its on-tool form (e.g.
+// "LOV_DR" -> "RD_VOL") and emit it as a JSON string. Sanitizes any
+// non-printable / quote-conflicting bytes to '.'.
+void jsonCmdField(const uint8_t *cmdReversed) {
+  jsonField(F("cmd"));
+  Serial.print('"');
+  for (int8_t i = 5; i >= 0; i--) {
+    uint8_t c = cmdReversed[i];
+    if (c >= 32 && c < 127 && c != '"' && c != '\\') Serial.write(c);
+    else                                              Serial.write('.');
+  }
+  Serial.print('"');
+}
+
+// Open an evt object: {"t":"evt","ms":<millis>,"evt":"<name>"
+// Caller adds optional fields, then closes with Serial.println('}').
+void evtBegin(const __FlashStringHelper *evtName) {
+  Serial.print(F("{\"t\":\"evt\""));
+  jsonIntField(F("ms"), millis());
+  jsonFstrField(F("evt"), evtName);
+}
+
 void processFrame() {
   if (bitCount == 0) return;
   framesSeen++;
@@ -187,57 +248,40 @@ void processFrame() {
   uint8_t  leftoverBits = bitCount & 7;
   uint16_t totalBits    = bitCount + (shifted ? 1 : 0);
 
-  Serial.print(F("RX  ["));
-  Serial.print(framesSeen);
-  Serial.print(F("] @"));
-  Serial.print(frameStartTime / 1000);
-  Serial.print(F("ms  "));
-  if (fromTool)      Serial.print(F("TOOL-> "));
-  else if (fromBatt) Serial.print(F("BATT-> "));
-  else               Serial.print(F("?--->  "));
-  if (dirAdc < 0) {
-    Serial.print(F("(--V)  "));
-  } else {
+  Serial.print(F("{\"t\":\"frame\""));
+  jsonIntField(F("ms"), millis());
+  jsonIntField(F("idx"), framesSeen);
+  if (fromTool)      jsonFstrField(F("dir"), F("TOOL"));
+  else if (fromBatt) jsonFstrField(F("dir"), F("BATT"));
+  else               jsonFstrField(F("dir"), F("?"));
+  if (dirAdc >= 0) {
     // adc * 5000 / 1024 = millivolts on a 5V/10-bit ADC
-    int32_t mv = ((int32_t)dirAdc * 5000L) / 1024L;
-    Serial.print('(');
-    Serial.print(mv / 1000);
-    Serial.print('.');
-    int frac = (mv % 1000) / 10;
-    if (frac < 10) Serial.print('0');
-    Serial.print(frac);
-    Serial.print(F("V)  "));
+    jsonIntField(F("dir_mv"), ((int32_t)dirAdc * 5000L) / 1024L);
   }
-  Serial.print(totalBits);
-  Serial.print(F("b  "));
-
-  for (uint16_t i = 0; i < numBytes; i++) {
-    printHex2(frameBits[i]);
-    Serial.print(' ');
-  }
+  jsonIntField(F("bits"), totalBits);
+  jsonBytesField(F("bytes"), frameBits, numBytes);
   if (leftoverBits) {
-    Serial.print(F("(+"));
-    Serial.print(leftoverBits);
-    Serial.print(F("b) "));
+    jsonIntField(F("leftover_bits"), leftoverBits);
   }
 
   bool crcOk = false;
   if (numBytes >= 2 && leftoverBits == 0) {
     uint8_t expected = crc8_dallas(frameBits, numBytes - 1);
-    Serial.print(F(" CRC "));
     if (expected == frameBits[numBytes - 1]) {
-      Serial.print(F("ok"));
+      jsonFstrField(F("crc"), F("ok"));
       crcOk = true;
     } else {
-      Serial.print(F("BAD(want "));
+      jsonFstrField(F("crc"), F("bad"));
+      jsonField(F("crc_want"));
+      Serial.print('"');
       printHex2(expected);
-      Serial.print(F(")"));
+      Serial.print('"');
     }
   }
 
   // Frame-type interpretation
   if (numBytes == 5) {
-    Serial.print(F("  [ID]"));
+    jsonFstrField(F("cmd"), F("ID"));
   } else if (numBytes == 9) {
     // For read commands: tool->batt is the query (byte[1]=index), batt->tool is
     // the response (data = LE uint16). For session frames (START_, ADJUST) the
@@ -247,128 +291,65 @@ void processFrame() {
                  : fromBatt ? false
                  : (frameBits[0] == 0x00);
 
-    Serial.print(F("  cmd=\""));
-    for (int8_t i = 7; i >= 2; i--) {
-      char c = (char)frameBits[i];
-      Serial.write((c >= 32 && c < 127) ? c : '.');
-    }
-    Serial.print(F("\" data=0x"));
-    printHex2(frameBits[1]);
-    printHex2(frameBits[0]);
+    jsonCmdField(&frameBits[2]);
     uint16_t v = ((uint16_t)frameBits[1] << 8) | frameBits[0];
-    Serial.print(F(" ("));
-    Serial.print(v);
-    Serial.print(F(")"));
+    jsonIntField(F("data"), v);
 
-    // Per-command interpretation
+    // Per-command interpretation -- fields per guiplan.md
     if (bytesEqual(&frameBits[2], RD_VOL_WIRE, 6)) {
-      if (isQuery) {
-        Serial.print(F("  cell "));
-        Serial.print(frameBits[1]);
-      } else {
-        Serial.print(F("  V="));
-        Serial.print(v / 100);
-        Serial.print('.');
-        if (v % 100 < 10) Serial.print('0');
-        Serial.print(v % 100);
-      }
+      if (isQuery) jsonIntField(F("cell"), frameBits[1]);
+      else         jsonIntField(F("v_cv"), v);
     } else if (bytesEqual(&frameBits[2], RD_TMP_WIRE, 6)) {
-      if (isQuery) {
-        Serial.print(F("  sensor "));
-        Serial.print(frameBits[1]);
-      } else {
-        Serial.print(F("  T="));
-        Serial.print(v);
-        Serial.print(F("F?"));
-      }
+      if (isQuery) jsonIntField(F("sensor"), frameBits[1]);
+      else         jsonIntField(F("temp_f"), v);
     } else if (bytesEqual(&frameBits[2], RD_SPC_WIRE, 6)) {
       if (!isQuery) {
-        Serial.print(F("  S="));
-        Serial.print(frameBits[1]);  // high byte = S-count
-        Serial.print(F("S model "));
-        Serial.print(frameBits[0]);
+        jsonIntField(F("s_count"), frameBits[1]);
+        jsonIntField(F("model"), frameBits[0]);
       }
     } else if (bytesEqual(&frameBits[2], RD_CAP_WIRE, 6)) {
-      if (!isQuery) {
-        Serial.print(F("  Ah/cell="));
-        Serial.print(v / 100);
-        Serial.print('.');
-        if (v % 100 < 10) Serial.print('0');
-        Serial.print(v % 100);
-      }
+      if (!isQuery) jsonIntField(F("ah_per_cell_x100"), v);
     } else if (bytesEqual(&frameBits[2], RD_FSH_WIRE, 6)) {
       if (isQuery) {
-        Serial.print(F("  Q=0x"));
-        printHex2(frameBits[1]);
-        printHex2(frameBits[0]);
+        jsonIntField(F("q"), v);
       } else {
-        Serial.print(F("  status=0x"));
+        jsonField(F("status"));
+        Serial.print(F("\"0x"));
         printHex2(frameBits[1]);
         printHex2(frameBits[0]);
-        if (frameBits[0] == 0xFF) {
-          Serial.print(F(" (Gen1 stub)"));
-        } else {
-          Serial.print(F(" (Gen2)"));
-        }
+        Serial.print('"');
+        jsonIntField(F("gen"), (frameBits[0] == 0xFF) ? 1 : 2);
       }
 
     // ---- Charging-protocol commands ----
+    } else if (bytesEqual(&frameBits[2], START_WIRE, 6)) {
+      if (fromTool) jsonIntField(F("chg_id"), v);
     } else if (bytesEqual(&frameBits[2], OUT_VM_WIRE, 6)) {
-      Serial.print(F("  V_out="));
-      Serial.print(v / 100);
-      Serial.print('.');
-      if (v % 100 < 10) Serial.print('0');
-      Serial.print(v % 100);
-      Serial.print('V');
+      jsonIntField(F("v_out_cv"), v);
     } else if (bytesEqual(&frameBits[2], OUT_CM_WIRE, 6)) {
-      Serial.print(F("  I_out="));
-      Serial.print(v / 100);
-      Serial.print('.');
-      if (v % 100 < 10) Serial.print('0');
-      Serial.print(v % 100);
-      Serial.print('A');
-    } else if (bytesEqual(&frameBits[2], CHGPCT_WIRE, 6)) {
-      // BATT-> reports actual SOC; TOOL-> always sends 0x0001 as an ack/seen.
-      if (fromBatt) {
-        Serial.print(F("  SOC="));
-        Serial.print(v);
-        Serial.print('%');
-      } else if (fromTool) {
-        Serial.print(F("  (ack)"));
-      }
+      jsonIntField(F("i_out_ca"), v);
     } else if (bytesEqual(&frameBits[2], EN_OUT_WIRE, 6)) {
-      Serial.print(v ? F("  output ENABLED") : F("  output DISABLED"));
+      jsonField(F("enabled"));
+      Serial.print(v ? F("true") : F("false"));
+    } else if (bytesEqual(&frameBits[2], CHGPCT_WIRE, 6)) {
+      if (fromBatt) jsonIntField(F("soc_pct"), v);
     } else if (bytesEqual(&frameBits[2], ADDCUR_WIRE, 6)) {
-      // BATT-> requests a current delta; TOOL-> echoes are not meaningful.
-      if (fromBatt) {
-        Serial.print(F("  +"));
-        Serial.print(v);
-      }
+      if (fromBatt) jsonIntField(F("add_cur"), v);
     } else if (bytesEqual(&frameBits[2], OUTCUR_WIRE, 6)) {
-      // TOOL-> reports actual delivered current; BATT-> echoes are not meaningful.
-      if (fromTool) {
-        Serial.print(F("  cur="));
-        Serial.print(v);
-      }
+      if (fromTool) jsonIntField(F("cur"), v);
     } else if (bytesEqual(&frameBits[2], FAN_ON_WIRE, 6)) {
-      // BATT-> requests; TOOL-> reports the actual fan setting.
-      if (fromBatt) {
-        Serial.print(F("  fan_req="));
-        Serial.print(v);
-      } else if (fromTool) {
-        Serial.print(F("  fan_set="));
-        Serial.print(v);
-      }
+      if (fromBatt)      jsonIntField(F("fan_req"), v);
+      else if (fromTool) jsonIntField(F("fan_set"), v);
     }
 
     if (crcOk && autoAdjustEnabled && bytesEqual(&frameBits[2], START_WIRE, 6)) {
       pendingAutoAdjust = true;
     }
-  } else if (numBytes == 18) {
-    Serial.print(F("  [paired msg]"));
   }
+  // 12-byte (96-bit) and 22-byte+1leftover (178-bit) handshake blobs:
+  // emitted as plain frame; no further interpretation.
 
-  Serial.println();
+  Serial.println('}');
 }
 
 void resetFrame() { bitCount = 0; }
@@ -430,17 +411,13 @@ void sendCommand(const char *cmdReversed, uint16_t data) {
   }
   frame[8] = crc8_dallas(frame, 8);
 
-  Serial.print(F("TX  @"));
-  Serial.print(millis());
-  Serial.print(F("ms  9b  "));
-  for (uint8_t i = 0; i < 9; i++) {
-    printHex2(frame[i]); Serial.print(' ');
-  }
-  Serial.print(F(" cmd=\""));
-  for (int8_t i = 7; i >= 2; i--) Serial.write((char)frame[i]);
-  Serial.print(F("\" data=0x"));
-  printHex2(frame[1]); printHex2(frame[0]);
-  Serial.println();
+  Serial.print(F("{\"t\":\"tx\""));
+  jsonIntField(F("ms"), millis());
+  jsonIntField(F("bits"), 73);
+  jsonBytesField(F("bytes"), frame, 9);
+  jsonCmdField(&frame[2]);
+  jsonIntField(F("data"), data);
+  Serial.println('}');
 
   txFrame(frame, 9);
 }
@@ -459,10 +436,11 @@ void setup() {
   while (ADCSRA & _BV(ADSC)) { /* discard first sample */ }
   (void)ADC;
 
-  Serial.println(F("EGO battery decoder - listening on pin 2 (D), A0 (direction)"));
-  Serial.println(F("Auto-ADJUST on START_ is OFF. Keys: r t s c f a x h"));
-  Serial.print(F("Initial line state: "));
-  Serial.println(digitalRead(DATA_PIN) ? F("HIGH") : F("LOW"));
+  Serial.println(F("{\"t\":\"hello\",\"fw\":\"egosniffer/1.0\",\"build\":\"" __DATE__ " " __TIME__ "\"}"));
+
+  evtBegin(F("line_init"));
+  jsonFstrField(F("line"), digitalRead(DATA_PIN) ? F("HIGH") : F("LOW"));
+  Serial.println('}');
 
   lastEdgeTime = micros();
   attachInterrupt(digitalPinToInterrupt(DATA_PIN), onEdge, CHANGE);
@@ -482,23 +460,20 @@ void loop() {
       if (duration < LOW_GLITCH_MAX) {
         // ringing/noise - ignore
       } else if (duration < LOW_SHORT_MAX) {
-        if (bitCount == 0) frameStartTime = lastEdgeTime;
         appendBit(1);   // short LOW = bit 1
       } else if (duration < LOW_LONG_MAX) {
-        if (bitCount == 0) frameStartTime = lastEdgeTime;
         appendBit(0);   // long LOW = bit 0
       } else if (duration < LOW_SYNC_MAX) {
         // sync pulse - if we had bits, flush; then start new frame
         if (bitCount > 0) processFrame();
         resetFrame();
-        frameStartTime = lastEdgeTime;
       } else {
         // unusually long LOW (e.g. "alone" beacon) - flush and report
         if (bitCount > 0) processFrame();
         resetFrame();
-        Serial.print(F("(long LOW "));
-        Serial.print(duration);
-        Serial.println(F("us)"));
+        evtBegin(F("long_low"));
+        jsonIntField(F("dur_us"), duration);
+        Serial.println('}');
       }
     } else {
       // Just fell: previous HIGH lasted `duration`
@@ -520,15 +495,16 @@ void loop() {
   if (droppedEdges) {
     uint8_t n = droppedEdges;
     droppedEdges = 0;
-    Serial.print(F("** dropped "));
-    Serial.print(n);
-    Serial.println(F(" edges **"));
+    evtBegin(F("dropped_edges"));
+    jsonIntField(F("n"), n);
+    Serial.println('}');
   }
 
   // Auto-respond to START_ (decoded in processFrame -> pendingAutoAdjust)
   if (pendingAutoAdjust) {
     pendingAutoAdjust = false;
-    Serial.println(F("    -> auto-ADJUST"));
+    evtBegin(F("auto_adjust"));
+    Serial.println('}');
     sendCommand("TSUJDA", 0x0000);
   }
 
@@ -536,7 +512,8 @@ void loop() {
   if (sweep.active && (millis() - sweep.lastTxMs) >= SWEEP_GAP_MS) {
     if (sweep.nextCell >= 14) {
       sweep.active = false;
-      Serial.println(F("    -> sweep done"));
+      evtBegin(F("sweep_done"));
+      Serial.println('}');
     } else {
       sendCommand("LOV_DR", (uint16_t)sweep.nextCell << 8);  // cell index goes in byte 1
       sweep.lastTxMs = millis();
@@ -561,13 +538,14 @@ void loop() {
       sweep.active = true;
       sweep.nextCell = 0;
       sweep.lastTxMs = millis() - SWEEP_GAP_MS;   // fire first one immediately
-      Serial.println(F("    -> sweep cells 0..13"));
+      evtBegin(F("sweep_start"));
+      Serial.println('}');
     } else if (c == 'x' || c == 'X') {
       autoAdjustEnabled = !autoAdjustEnabled;
-      Serial.print(F("Auto-ADJUST "));
-      Serial.println(autoAdjustEnabled ? F("ENABLED") : F("DISABLED"));
-    } else if (c == 'h' || c == '?') {
-      Serial.println(F("Keys: r=sweep-all-cells t=RD_TMP s=RD_SPC c=RD_CAP f=RD_FSH a=ADJUST x=toggle-auto-ADJUST"));
+      evtBegin(F("auto_adjust_toggle"));
+      jsonField(F("on"));
+      Serial.print(autoAdjustEnabled ? F("true") : F("false"));
+      Serial.println('}');
     }
   }
 }
