@@ -306,7 +306,7 @@ void processFrame() {
     } else if (bytesEqual(&frameBits[2], RD_SPC_WIRE, 6)) {
       if (!isQuery) {
         jsonIntField(F("s_count"), frameBits[1]);
-        jsonIntField(F("model"), frameBits[0]);
+        jsonIntField(F("p_count"), frameBits[0] + 1);
       }
     } else if (bytesEqual(&frameBits[2], RD_CAP_WIRE, 6)) {
       if (!isQuery) jsonIntField(F("ah_per_cell_x100"), v);

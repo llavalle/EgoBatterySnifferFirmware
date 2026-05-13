@@ -303,8 +303,8 @@ and the conversation pattern are different.
 | `ADJUST`  | `TSUJDA`         | **tool → batt** *and* **batt → tool** | Session handshake. Tool always sends `0x0000`. Battery's reply differs by generation: Gen1 echoes `0x0000`, Gen2 replies `0x00A0`. The `0x00A0` reply is the cleanest Gen2 marker we have. |
 | `RD_VOL`  | `LOV_DR`         | tool ⇄ batt      | Tool: `byte[1]=cell_idx (0..13)`, `byte[0]=0x00`. Batt: voltage in centivolts (`v/100` V). |
 | `RD_TMP`  | `PMT_DR`         | tool ⇄ batt      | Tool: `byte[1]=sensor_idx`. Batt: temperature, units appear to be °F.       |
-| `RD_SPC`  | `CPS_DR`         | tool ⇄ batt      | Tool: `0x0000`. Batt: `byte[1]=S-count`, `byte[0]=model`. **`model=1` on Gen1, `model=3` on Gen2** (one-sample evidence — may be a generation marker). |
-| `RD_CAP`  | `PAC_DR`         | tool ⇄ batt      | Tool: `0x0000`. Batt: Ah/cell × 100.        |
+| `RD_SPC`  | `CPS_DR`         | tool ⇄ batt      | Tool: `0x0000`. Batt: `byte[1]=S-count` (series cells, always 14), `byte[0]=P-count − 1` (parallel cells, 0-indexed). Firmware emits `p_count` with the +1 baked in. |
+| `RD_CAP`  | `PAC_DR`         | tool ⇄ batt      | Tool: `0x0000`. Batt: Ah/cell × 100. Total pack Ah = `p_count × ah_per_cell_x100 / 100`. |
 | `RD_FSH`  | `HSF_DR`         | tool ⇄ batt      | Tool: `Q=0x3800`. Batt: status; `byte[0]=0xFF` = Gen1 stub, otherwise Gen2 status bits. |
 
 ### Charging commands
