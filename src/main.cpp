@@ -297,7 +297,17 @@ void processFrame() {
     jsonIntField(F("data"), v);
 
     // Per-command interpretation -- fields per guiplan.md
-    if (bytesEqual(&frameBits[2], RD_VOL_WIRE, 6)) {
+    if (bytesEqual(&frameBits[2], ADJUST_WIRE, 6)) {
+      // ADJUST is the gen marker: tool always sends 0x0000; the battery's
+      // reply distinguishes generations -- Gen1 echoes 0x0000, Gen2 replies
+      // 0x00A0. (Documented in firmware README; verified against a Gen1
+      // Nexus 3000 capture. Re-check the 0x00A0 value when a Gen2 ADJUST
+      // sniff lands.)
+      if (fromBatt) {
+        if      (v == 0x0000) jsonIntField(F("gen"), 1);
+        else if (v == 0x00A0) jsonIntField(F("gen"), 2);
+      }
+    } else if (bytesEqual(&frameBits[2], RD_VOL_WIRE, 6)) {
       if (isQuery) jsonIntField(F("cell"), frameBits[1]);
       else         jsonIntField(F("v_cv"), v);
     } else if (bytesEqual(&frameBits[2], RD_TMP_WIRE, 6)) {
@@ -311,15 +321,23 @@ void processFrame() {
     } else if (bytesEqual(&frameBits[2], RD_CAP_WIRE, 6)) {
       if (!isQuery) jsonIntField(F("ah_per_cell_x100"), v);
     } else if (bytesEqual(&frameBits[2], RD_FSH_WIRE, 6)) {
+      // RD_FSH is a flash-byte read: addr = high byte of the 16-bit data
+      // word, value = low byte. Tool writes addr with value=0; battery
+      // echoes addr in the high byte and returns the byte at that addr.
+      // Gen detection lives on ADJUST, not here -- the address being
+      // queried tells us what the tool wants, not what the pack is.
+      uint8_t addr = frameBits[1];
+      uint8_t val  = frameBits[0];
+      jsonIntField(F("fsh_addr"), addr);
       if (isQuery) {
         jsonIntField(F("q"), v);
       } else {
+        jsonIntField(F("fsh_value"), val);
         jsonField(F("status"));
         Serial.print(F("\"0x"));
-        printHex2(frameBits[1]);
-        printHex2(frameBits[0]);
+        printHex2(addr);
+        printHex2(val);
         Serial.print('"');
-        jsonIntField(F("gen"), (frameBits[0] == 0xFF) ? 1 : 2);
       }
 
     // ---- Charging-protocol commands ----
