@@ -25,7 +25,7 @@ the 0x38xx interpretation remains unverified.
 
 ## Page map across captures
 
-|       | 7.5 Ah @ 96 % | 7.5 Ah @ 37 % | 5.0 Ah @ 86 % | 5.0 Ah @ 32 % | Notes |
+| Byte  | 7.5 Ah @ 96 % | 7.5 Ah @ 37 % | 5.0 Ah @ 86 % | 5.0 Ah @ 32 % | Notes |
 |-------|---------------|---------------|---------------|---------------|-------|
 | 0x38  | 0xFF (stub)   | 0xFF (stub)   | 0xFF (stub)   | 0xFF (stub)   | Gen 1 marker |
 | 0x78  | **0x23** (35) | **0x23** (35) | **0x23** (35) | **0x23** (35) | constant — likely fixed identifier |
