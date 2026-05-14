@@ -25,13 +25,13 @@ the 0x38xx interpretation remains unverified.
 
 ## Page map across captures
 
-|       | 7.5 Ah @ 96 % SoC | 7.5 Ah @ 37 % SoC | 5.0 Ah @ 86 % SoC | Notes |
-|-------|-------------------|-------------------|-------------------|-------|
-| 0x38  | 0xFF (stub)       | 0xFF (stub)       | 0xFF (stub)       | Gen 1 marker |
-| 0x78  | **0x23** (35)     | **0x23** (35)     | **0x23** (35)     | constant — likely fixed identifier |
-| 0x79  | **0xF8** (248)    | **0xF8** (248)    | 0xD0 (208)        | per-pack, stable across SoC |
-| 0x7A  | **0x2A** (42)     | **0x2A** (42)     | **0x2A** (42)     | constant — likely fixed identifier |
-| 0x7B  | **0x79** (121)    | **0x79** (121)    | 0x06 (6)          | per-pack, stable across SoC |
+|       | 7.5 Ah @ 96 % | 7.5 Ah @ 37 % | 5.0 Ah @ 86 % | 5.0 Ah @ 32 % | Notes |
+|-------|---------------|---------------|---------------|---------------|-------|
+| 0x38  | 0xFF (stub)   | 0xFF (stub)   | 0xFF (stub)   | 0xFF (stub)   | Gen 1 marker |
+| 0x78  | **0x23** (35) | **0x23** (35) | **0x23** (35) | **0x23** (35) | constant — likely fixed identifier |
+| 0x79  | **0xF8** (248)| **0xF8** (248)| **0xD0** (208)| **0xD0** (208)| per-pack, stable across SoC |
+| 0x7A  | **0x2A** (42) | **0x2A** (42) | **0x2A** (42) | **0x2A** (42) | constant — likely fixed identifier |
+| 0x7B  | **0x79** (121)| **0x79** (121)| **0x06** (6)  | **0x06** (6)  | per-pack, stable across SoC |
 
 Source captures (all in `EgoBatterySnifferGui/captures/`):
 - `capture_2026-05-14_132118_nexus3000_7.5Ah_96soc_charging_complete_plug.ndjson`
@@ -40,6 +40,8 @@ Source captures (all in `EgoBatterySnifferGui/captures/`):
   — same 7.5 Ah pack after discharge to 37 % SoC, 3.59 V/cell avg
 - `capture_2026-05-14_135931_nexus3000_5Ah_86_4.3.ndjson`
   — 5.0 Ah pack, 86 % SoC, 0.11 A load, 73 °F, 4.07 V/cell avg
+- `capture_2026-05-14_162112_nexus3000_5ah_32soc_1.6of5.0_remains.ndjson`
+  — same 5.0 Ah pack after discharge to 32 % SoC, 3.55 V/cell avg
 
 ## Current best guesses
 
@@ -62,12 +64,15 @@ packs and to drive any "this pack is shot" warnings. Both observed
 values are < nameplate (which a healthy degradation model demands) and
 are in the same units as `RD_CAP` (cAh/cell), which is a tidy reuse.
 
-**Confirmed: this is a slow-moving / persistent register.** The
-2026-05-14 152338 capture showed 0x79 still = 0xF8 after discharging
-the 7.5 Ah pack from 96 % SoC down to 37 % SoC. So 0x79 is *not*
-tracking SoC at all — it's the kind of value that only updates on a
-full cycle (capacity learning) or never updates at all (manufacturing
-constant). Still consistent with the cAh-per-cell-SoH hypothesis.
+**Confirmed: this is a slow-moving / persistent register.** Demonstrated
+twice now:
+- 7.5 Ah pack: 0x79 stayed at 0xF8 across the 96 % → 37 % discharge.
+- 5.0 Ah pack: 0x79 stayed at 0xD0 across the 86 % → 32 % discharge.
+
+So 0x79 is *not* tracking SoC at all — it's the kind of value that only
+updates on a full cycle (capacity learning) or never updates at all
+(manufacturing constant). Still consistent with the cAh-per-cell-SoH
+hypothesis.
 
 **Still not proven.** To distinguish "learned SoH" from "permanent
 manufacturing constant", we'd need to either (a) catch 0x79 changing
@@ -82,10 +87,12 @@ nameplate).
 | 7.5 Ah       | 121      |
 | 5.0 Ah       | 6        |
 
-**Confirmed stable across SoC** by the 96 % → 37 % discharge on the
-7.5 Ah pack (still 0x79 in both captures). That rules out the
-"recent-discharge / last-DOD telemetry" branch — 0x7B doesn't update on
-each session.
+**Confirmed stable across SoC** on both packs:
+- 7.5 Ah pack stayed at 0x79 across 96 % → 37 %.
+- 5.0 Ah pack stayed at 0x06 across 86 % → 32 %.
+
+That rules out the "recent-discharge / last-DOD telemetry" branch —
+0x7B doesn't update on each session.
 
 Remaining possibilities:
 - Cycle count (lifetime).
@@ -110,9 +117,9 @@ isn't the *source* of SoC.
 
 ## TODOs (in priority order)
 
-- [x] **Re-sniff the same pack at a different SoC.** Done with the
-      96 % → 37 % discharge on the 7.5 Ah pack. Result: 0x79 and 0x7B
-      are persistent / SoC-independent.
+- [x] **Re-sniff the same pack at a different SoC.** Done twice:
+      96 % → 37 % on the 7.5 Ah pack, 86 % → 32 % on the 5.0 Ah pack.
+      Both 0x79 and 0x7B are persistent / SoC-independent on both packs.
 - [ ] **Sniff a fresh-from-factory Gen 1 pack** (or any pack whose
       true age/SoH we know). If 0x79 reads near 0xFA = 250 on a young
       pack, the learned-SoH theory is essentially confirmed.
